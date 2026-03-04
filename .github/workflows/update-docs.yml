@@ -1,0 +1,77 @@
+name: Auto-Update Docs on PR Merge
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers whenever a PR is merged into main or master.
+# The job checks out the repo, runs the Python agent (which calls Claude),
+# then commits any README / CHANGELOG changes directly back to the branch.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+      - master
+
+jobs:
+  update-docs:
+    # Only run when the PR was actually merged, not just closed
+    if: github.event.pull_request.merged == true
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # needed to commit README/CHANGELOG back
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a PAT here if you want the commit to trigger other workflows.
+          # GITHUB_TOKEN commits are intentionally excluded from triggering
+          # new workflow runs to prevent infinite loops.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Python setup ──────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install anthropic requests --quiet
+
+      # ── 3. Run the doc-update agent ──────────────────────────────────────
+      - name: Update README and CHANGELOG via Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER:         ${{ github.event.pull_request.number }}
+          PR_TITLE:          ${{ github.event.pull_request.title }}
+          PR_BODY:           ${{ github.event.pull_request.body }}
+          PR_AUTHOR:         ${{ github.event.pull_request.user.login }}
+          PR_MERGED_AT:      ${{ github.event.pull_request.merged_at }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python .github/scripts/update_docs.py
+
+      # ── 4. Commit & push (only if files actually changed) ────────────────
+      - name: Commit and push doc updates
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+
+          git add README.md CHANGELOG.md
+
+          # Exit cleanly if there's nothing to commit
+          if git diff --staged --quiet; then
+            echo "📄 No documentation changes detected — skipping commit."
+            exit 0
+          fi
+
+          git commit -m "docs: auto-update README + CHANGELOG for PR #${{ github.event.pull_request.number }} [skip ci]"
+
+          # Pull with rebase to handle concurrent merges gracefully
+          git pull --rebase origin ${{ github.event.pull_request.base.ref }}
+          git push origin HEAD:${{ github.event.pull_request.base.ref }}
