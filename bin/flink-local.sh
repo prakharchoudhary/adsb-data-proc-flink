@@ -11,6 +11,8 @@ JOB_CLASS="com.example.flighttrack.phase1.IngestFilterJobKt"
 JAR_PATH_DEFAULT="target/flight-track-analytics-1.0-SNAPSHOT.jar"
 UI_URL="${UI_URL:-http://localhost:8081}"
 JOB_PARALLELISM="${JOB_PARALLELISM:-}"
+JOB_PHASE="${JOB_PHASE:-phase1}"
+JOB_CLASS_OVERRIDE="${JOB_CLASS_OVERRIDE:-}"
 
 usage() {
   cat <<EOF
@@ -29,20 +31,28 @@ Commands:
   stop
     Stop local Flink cluster from $FLINK_HOME
 
-  run [-p N|--parallelism N] [inputDir] [outputDir] [parallelism]
+  run [--phase phase1|phase2|phase3] [-p N|--parallelism N] [--class FQCN] [inputDir] [outputDir] [parallelism]
     Build jar and submit job to local cluster.
     Defaults:
       inputDir  = ./data/raw
-      outputDir = ./data/phase1-out/\$(date +%Y-%m-%d--%H)
+      outputDir = ./data/<phase>-out/\$(date +%Y-%m-%d--%H)
       parallelism = cluster default (unless set via -p/--parallelism or JOB_PARALLELISM)
+      phase = phase1
+      class (by phase):
+        phase1 -> com.example.flighttrack.phase1.IngestFilterJobKt
+        phase2 -> com.example.flighttrack.phase2.WindowAggregationJobKt
+        phase3 -> com.example.flighttrack.phase3.StatefulDetectionJob
 
     Examples:
       $0 run
       $0 run -p 8 ./data/raw ./data/phase1-out/run-p8
+      $0 run --phase phase2 -p 4 ./data/raw ./data/phase2-out/run-p4
+      $0 run --phase phase3 --class com.example.flighttrack.phase3.MyMainKt ./data/raw ./data/phase3-out/run
       JOB_PARALLELISM=6 $0 run ./data/raw ./data/phase1-out/run-p6
 
 Environment overrides:
-  FLINK_VERSION, SCALA_VERSION, INSTALL_ROOT, FLINK_HOME, UI_URL, JOB_PARALLELISM
+  FLINK_VERSION, SCALA_VERSION, INSTALL_ROOT, FLINK_HOME, UI_URL,
+  JOB_PARALLELISM, JOB_PHASE, JOB_CLASS_OVERRIDE
 EOF
 }
 
@@ -155,14 +165,15 @@ status_cluster() {
     echo "UP: Flink UI reachable at $UI_URL"
   else
     echo "DOWN: Flink UI not reachable at $UI_URL"
-    exit 1
+    return 1
   fi
 }
 
 run_job() {
   local input_dir="${1:-./data/raw}"
-  local output_dir="${2:-./data/phase1-out/$(date +%Y-%m-%d--%H)}"
+  local output_dir="${2:-}"
   local run_parallelism="${3:-}"
+  local run_class="${4:-$JOB_CLASS}"
   local jar_path="$JAR_PATH_DEFAULT"
 
   require_cmd mvn
@@ -180,6 +191,23 @@ run_job() {
     exit 1
   fi
 
+  require_cmd jar
+  # Normalize potential CR characters from copied args/output.
+  run_class="${run_class//$'\r'/}"
+  local class_path
+  class_path="$(printf '%s' "$run_class" | tr '.' '/')"
+  class_path="${class_path}.class"
+  local classes_list
+  classes_list="$(jar tf "$jar_path" | tr -d '\r')"
+  if ! grep -Fqx -- "$class_path" <<<"$classes_list"; then
+    echo "Entry class not found in jar: $run_class" >&2
+    echo "Expected class path: $class_path" >&2
+    echo "Available matching classes:" >&2
+    printf '%s\n' "$classes_list" | grep -F "com/example/flighttrack/phase" | grep -F "Job" >&2 || true
+    echo "Use --class with a valid fully-qualified class name." >&2
+    exit 1
+  fi
+
   local run_args=()
   if [[ -n "$run_parallelism" ]]; then
     if [[ ! "$run_parallelism" =~ ^[1-9][0-9]*$ ]]; then
@@ -192,7 +220,7 @@ run_job() {
   echo "Submitting job..."
   "$FLINK_BIN" run \
     "${run_args[@]}" \
-    -c "$JOB_CLASS" \
+    -c "$run_class" \
     "$jar_path" \
     "$input_dir" \
     "$output_dir"
@@ -217,15 +245,62 @@ main() {
       ;;
     run)
       shift
+      local run_phase="$JOB_PHASE"
       local run_parallelism="$JOB_PARALLELISM"
-      if [[ "${1:-}" == "-p" || "${1:-}" == "--parallelism" ]]; then
-        run_parallelism="${2:-}"
-        shift 2
+      local run_class="$JOB_CLASS_OVERRIDE"
+
+      while [[ $# -gt 0 ]]; do
+        case "${1:-}" in
+          -p|--parallelism)
+            run_parallelism="${2:-}"
+            shift 2
+            ;;
+          --phase)
+            run_phase="${2:-}"
+            shift 2
+            ;;
+          --class)
+            run_class="${2:-}"
+            shift 2
+            ;;
+          --)
+            shift
+            break
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+
+      local default_output_dir
+      case "$run_phase" in
+        phase1)
+          JOB_CLASS="com.example.flighttrack.phase1.IngestFilterJobKt"
+          default_output_dir="./data/phase1-out/$(date +%Y-%m-%d--%H)"
+          ;;
+        phase2)
+          JOB_CLASS="com.example.flighttrack.phase2.WindowAggregationJobKt"
+          default_output_dir="./data/phase2-out/$(date +%Y-%m-%d--%H)"
+          ;;
+        phase3)
+          JOB_CLASS="com.example.flighttrack.phase3.StatefulDetectionJob"
+          default_output_dir="./data/phase3-out/$(date +%Y-%m-%d--%H)"
+          ;;
+        *)
+          echo "Invalid phase '$run_phase'. Use: phase1, phase2, or phase3." >&2
+          exit 1
+          ;;
+      esac
+
+      if [[ -z "$run_class" ]]; then
+        run_class="$JOB_CLASS"
       fi
+
       if [[ -z "$run_parallelism" && -n "${3:-}" ]]; then
         run_parallelism="${3}"
       fi
-      run_job "${1:-}" "${2:-}" "$run_parallelism"
+      run_job "${1:-./data/raw}" "${2:-$default_output_dir}" "$run_parallelism" "$run_class"
       ;;
     *)
       usage
