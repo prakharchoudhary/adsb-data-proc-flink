@@ -29,11 +29,19 @@ The pipeline consists of three sequential phases:
 - **Job:** `WindowAggregationJob`
 - **Input:** Validated aircraft records from Phase 1
 - **Processing:**
-  - Groups records by aircraft ICAO hex code
-  - Aggregates within tumbling time windows
+  - **Exercise 2-A:** Computes average ground speed per aircraft using 5-minute tumbling windows
+  - **Exercise 2-B:** Tracks peak altitude per aircraft using 10-minute sliding windows (2-minute slide)
+  - **Exercise 2-C:** Detects flight sessions with 30-minute session windows (gaps > 30 min close a session)
+  - **Exercise 2-D:** Captures late-arriving records via side output for watermark calibration analysis
+  - Assigns event-time watermarks with 15-minute bounded out-of-orderness tolerance
+  - Aggregates within windows using specialized `AggregateFunction` implementations
   - Computes min/max/avg statistics for altitude, speed, position
   - Collects distinct squawk codes and emergency statuses
-- **Output:** `FlightSegment` summaries per window
+- **Output:** Four separate streams:
+  - `FlightSegment` summaries for average speed (tumbling windows)
+  - `FlightSegment` summaries for peak altitude (sliding windows)
+  - `FlightSegment` summaries for flight sessions (session windows)
+  - `LateRecord` annotations for records that arrived after their window closed
 
 ### Phase 3: Anomaly Detection
 - **Job:** `StatefulDetectionJob`
@@ -119,7 +127,7 @@ src/main/kotlin/com/example/flighttrack/
 │   ├── AdsbFileSource.kt          # File source connector
 │   └── AdsbSnapshotFormat.kt      # Deserialization format
 ├── phase2/
-│   ├── WindowAggregationJob.kt    # Phase 2 Flink job
+│   ├── WindowAggregationJob.kt    # Phase 2 Flink job (all 4 exercises)
 │   └── WindowAggregator.kt        # Aggregation logic
 ├── phase3/
 │   ├── StatefulDetectionJob.kt    # Phase 3 Flink job
@@ -136,6 +144,9 @@ src/test/kotlin/com/example/flighttrack/
 │   └── WindowAggregationJobTest.kt
 └── phase3/
     └── StatefulDetectionJobTest.kt
+
+bin/
+└── flink-local.sh                 # Local Flink cluster automation script
 ```
 
 ## Building
@@ -148,7 +159,47 @@ Produces a fat JAR suitable for Flink cluster deployment.
 
 ## Running
 
-Each phase is a standalone Flink job. Submit to a Flink cluster:
+### Using the Automation Script (Recommended)
+
+The `bin/flink-local.sh` script provides convenient commands for managing a local Flink cluster and submitting jobs:
+
+```bash
+# Install and start local Flink cluster
+./bin/flink-local.sh install
+./bin/flink-local.sh start
+
+# Check cluster status
+./bin/flink-local.sh status
+
+# Run Phase 1
+./bin/flink-local.sh run --phase phase1
+
+# Run Phase 2 with custom parallelism
+./bin/flink-local.sh run --phase phase2 -p 4 ./data/raw ./data/phase2-out/run-p4
+
+# Run Phase 3 with custom output directory
+./bin/flink-local.sh run --phase phase3 ./data/raw ./data/phase3-out/run
+
+# Stop cluster
+./bin/flink-local.sh stop
+```
+
+**Script Features:**
+- Automatic Flink installation and cluster lifecycle management
+- Phase-aware job submission (automatically selects correct main class)
+- Custom parallelism configuration via `-p` flag
+- Custom input/output directory paths
+- JAR validation (verifies entry class exists before submission)
+- Environment variable overrides: `FLINK_VERSION`, `JOB_PARALLELISM`, `JOB_PHASE`, `UI_URL`
+
+**Default Paths:**
+- Phase 1 output: `./data/phase1-out/YYYY-MM-DD--HH`
+- Phase 2 output: `./data/phase2-out/YYYY-MM-DD--HH`
+- Phase 3 output: `./data/phase3-out/YYYY-MM-DD--HH`
+
+### Manual Submission
+
+Each phase can also be submitted directly to a Flink cluster:
 
 ```bash
 # Phase 1
@@ -162,6 +213,54 @@ flink run -c com.example.flighttrack.phase3.StatefulDetectionJob target/flight-t
 ```
 
 **Configuration:** Job parameters (file paths, window sizes, thresholds) are currently hardcoded in each job class. Future work will externalize these to `flink-conf.yaml` or runtime parameters.
+
+## Phase 2 Details
+
+Phase 2 runs in **STREAMING** execution mode (not BATCH) to preserve watermark mechanics for educational purposes. The job produces four separate outputs:
+
+### Exercise 2-A: Average Ground Speed
+- **Window Type:** Tumbling (non-overlapping)
+- **Window Size:** 5 minutes
+- **Output:** Average ground speed per aircraft per window
+- **Side Effect:** Captures late records for Exercise 2-D
+
+### Exercise 2-B: Peak Altitude
+- **Window Type:** Sliding (overlapping)
+- **Window Size:** 10 minutes
+- **Slide Interval:** 2 minutes
+- **Overlap Factor:** Each record appears in up to 5 windows
+- **Output:** Maximum altitude per aircraft per window
+
+### Exercise 2-C: Flight Session Detection
+- **Window Type:** Session (dynamic boundaries)
+- **Gap Threshold:** 30 minutes
+- **Behavior:** A session closes when no ping is received for 30 consecutive minutes in event time
+- **Merge Logic:** Sessions merge if a late record bridges their gap
+- **Use Case:** Distinguish between separate flights (e.g., aircraft with layover will produce 2 sessions)
+
+### Exercise 2-D: Late Record Analysis
+- **Mechanism:** Side output via `OutputTag<AircraftRecord>`
+- **Captured From:** Exercise 2-A tumbling window (shared watermark applies to all windows)
+- **Annotation:** Each late record is tagged with:
+  - `eventTimeMs`: record's original timestamp
+  - `latenessMs`: `currentWatermark - eventTimeMs`
+- **Purpose:** Watermark calibration tuning (current tolerance: 15 minutes bounded out-of-orderness)
+
+**Post-Run Analysis Commands:**
+```bash
+# Count late records
+wc -l data/phase2-out/late-records/*
+
+# Find maximum lateness (requires jq)
+cat data/phase2-out/late-records/* | jq 'max_by(.latenessMs) | .latenessMs'
+
+# Calculate late record percentage
+total=$(wc -l < data/phase2-out/avg-speed/*)
+late=$(wc -l < data/phase2-out/late-records/*)
+echo "scale=2; $late / $total * 100" | bc
+```
+
+**Tuning Guideline:** If late % > 5%, increase watermark tolerance. If late % = 0%, tolerance may be overly conservative.
 
 ## Testing
 
